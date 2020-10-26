@@ -8,6 +8,7 @@ local setmetatable = setmetatable
 local tostring = tostring
 local ipairs = ipairs
 local table = table
+local type = type
 local min = math.min
 
 
@@ -31,7 +32,7 @@ local function clean_history(self, upstream_pk)
   local cleanup_factor = 0.1
 
   --cleaning up history, check if it's necessary...
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk)
   if not targets then
     return nil, err, err_t
   end
@@ -64,10 +65,11 @@ local function clean_history(self, upstream_pk)
     ngx.log(ngx.NOTICE, "[Target DAO] Starting cleanup of target table for upstream ",
                tostring(upstream_pk.id))
     local cnt = 0
-    for _, entry in ipairs(delete) do
+    -- reverse again; so deleting oldest entries first
+    for i = #delete, 1, -1 do
+      local entry = delete[i]
+
       -- notice super - this is real delete (not creating a new entity with weight = 0)
-      -- not sending update events, one event at the end, based on the
-      -- post of the new entry should suffice to reload only once
       self.super.delete(self, { id = entry.id })
       -- ignoring errors here, deleted by id, so should not matter
       -- in case another kong-node does the same cleanup simultaneously
@@ -90,7 +92,7 @@ local function format_target(target)
 end
 
 
-function _TARGETS:insert(entity)
+function _TARGETS:insert(entity, options)
   if entity.target then
     local formatted_target, err = format_target(entity.target)
     if not formatted_target then
@@ -100,12 +102,24 @@ function _TARGETS:insert(entity)
     entity.target = formatted_target
   end
 
-  local row, err, err_t = self.super.insert(self, entity)
-  if row then
-    clean_history(self, entity.upstream)
-  end
+  -- cleaning up will NOT send invalidation events, hence we only add the new
+  -- entry AFTER the cleanup, such that the cleanup will be picked up by the
+  -- other nodes based on the event of the newly added entry
+  clean_history(self, entity.upstream)
 
-  return row, err, err_t
+  return self.super.insert(self, entity, options)
+end
+
+
+function _TARGETS:upsert(pk, entity, options)
+  entity.id = pk.id
+  return self:insert(entity, options)
+end
+
+
+function _TARGETS:upsert_by_target(unique_key, entity, options)
+  entity.target = unique_key
+  return self:insert(entity, options)
 end
 
 
@@ -123,7 +137,25 @@ function _TARGETS:delete(pk)
 end
 
 
-function _TARGETS:delete_by_target(tgt)
+function _TARGETS:select(pk, options)
+  local target, err, err_t = self.super.select(self, pk, options)
+  if err then
+    return nil, err, err_t
+  end
+
+  if target then
+    local formatted_target, err = format_target(target.target)
+    if not formatted_target then
+      local err_t = self.errors:schema_violation({ target = err })
+      return nil, tostring(err_t), err_t
+    end
+    target.target = formatted_target
+  end
+  return target
+end
+
+
+function _TARGETS:delete_by_target(tgt, options)
   local target, err, err_t = self:select_by_target(tgt)
   if err then
     return nil, err, err_t
@@ -133,7 +165,7 @@ function _TARGETS:delete_by_target(tgt)
     target   = target.target,
     upstream = target.upstream,
     weight   = 0,
-  })
+  }, options)
 end
 
 
@@ -142,7 +174,22 @@ end
 -- with weight=0 (i.e. the "raw" representation of targets in
 -- the database)
 function _TARGETS:page_for_upstream_raw(upstream_pk, ...)
-  return self.super.page_for_upstream(self, upstream_pk, ...)
+  local page, err, err_t, offset =
+    self.super.page_for_upstream(self, upstream_pk, ...)
+  if err then
+    return nil, tostring(err), err_t
+  end
+
+  for _, target in ipairs(page) do
+    local formatted_target, err = format_target(target.target)
+    if not formatted_target then
+      local err_t = self.errors:schema_violation({ target = err })
+      return nil, tostring(err_t), err_t
+    end
+    target.target = formatted_target
+  end
+
+  return page, nil, nil, offset
 end
 
 
@@ -150,14 +197,20 @@ end
 -- including entries that have been since overriden, and those
 -- with weight=0 (i.e. the "raw" representation of targets in
 -- the database)
-function _TARGETS:select_by_upstream_raw(upstream_pk, ...)
+function _TARGETS:select_by_upstream_raw(upstream_pk, options)
   local targets = {}
 
   -- Note that each_for_upstream is not overridden, so it returns "raw".
-  for target, err, err_t in self:each_for_upstream(upstream_pk, ...) do
+  for target, err, err_t in self:each_for_upstream(upstream_pk, nil, options) do
     if not target then
       return nil, err, err_t
     end
+    local formatted_target, err = format_target(target.target)
+    if not formatted_target then
+      local err_t = self.errors:schema_violation({ target = err })
+      return nil, tostring(err_t), err_t
+    end
+    target.target = formatted_target
 
     table.insert(targets, target)
   end
@@ -175,7 +228,7 @@ function _TARGETS:page_for_upstream(upstream_pk, size, offset, options)
   -- extract the page requested by the user.
 
   -- Read all targets; this returns the target history sorted chronologically
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000, options)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, options)
   if not targets then
     return nil, err, err_t
   end
@@ -204,10 +257,21 @@ function _TARGETS:page_for_upstream(upstream_pk, size, offset, options)
     end
   end
 
+  local pagination = self.pagination
+
+  if type(options) == "table" and type(options.pagination) == "table" then
+    pagination = utils.table_merge(pagination, options.pagination)
+  end
+
+  if not size then
+    size = pagination.page_size
+  end
+
+  size = min(size, pagination.max_page_size)
+  offset = offset or 0
+
   -- Extract the requested page
   local page = setmetatable({}, cjson.array_mt)
-  size = min(size or 100, 1000)
-  offset = offset or 0
   for i = 1 + offset, size + offset do
     local target = all_active_targets[i]
     if not target then
@@ -240,19 +304,37 @@ function _TARGETS:page_for_upstream_with_health(upstream_pk, ...)
     ngx.log(ngx.ERR, "failed getting upstream health: ", err)
   end
 
-  for _, target in ipairs(targets) do
-    -- In case of DNS errors when registering a target,
-    -- that error happens inside lua-resty-dns-client
-    -- and the end-result is that it just doesn't launch the callback,
-    -- which means kong.runloop.balancer and healthchecks don't get
-    -- notified about the target at all. We extrapolate the DNS error
-    -- out of the fact that the target is missing from the balancer.
-    -- Note that lua-resty-dns-client does retry by itself,
-    -- meaning that if DNS is down and it eventually resumes working, the
-    -- library will issue the callback and the target will change state.
-    target.health = health_info
-                   and (health_info[target.target] or "DNS_ERROR")
-                   or  "HEALTHCHECKS_OFF"
+  if health_info then
+    for _, target in ipairs(targets) do
+      -- In case of DNS errors when registering a target,
+      -- that error happens inside lua-resty-dns-client
+      -- and the end-result is that it just doesn't launch the callback,
+      -- which means kong.runloop.balancer and healthchecks don't get
+      -- notified about the target at all. We extrapolate the DNS error
+      -- out of the fact that the target is missing from the balancer.
+      -- Note that lua-resty-dns-client does retry by itself,
+      -- meaning that if DNS is down and it eventually resumes working, the
+      -- library will issue the callback and the target will change state.
+      if health_info[target.target] ~= nil and
+        #health_info[target.target].addresses > 0 then
+        target.health = "HEALTHCHECKS_OFF"
+        -- If any of the target addresses are healthy, then the target is
+        -- considered healthy.
+        for _, address in ipairs(health_info[target.target].addresses) do
+          if address.health == "HEALTHY" then
+            target.health = "HEALTHY"
+            break
+          elseif address.health == "UNHEALTHY" then
+            target.health = "UNHEALTHY"
+          end
+
+        end
+      else
+        target.health = "DNS_ERROR"
+      end
+      target.data = health_info[target.target]
+    end
+
   end
 
   return targets, nil, nil, next_offset
@@ -260,12 +342,13 @@ end
 
 
 function _TARGETS:select_by_upstream_filter(upstream_pk, filter, options)
-  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, 1000, options)
+  local targets, err, err_t = self:select_by_upstream_raw(upstream_pk, options)
   if not targets then
     return nil, err, err_t
   end
 
-  for _, t in ipairs(targets) do
+  for i = #targets, 1, -1 do
+    local t = targets[i]
     if t.id == filter.id or t.target == filter.target then
       return t
     end
@@ -273,23 +356,49 @@ function _TARGETS:select_by_upstream_filter(upstream_pk, filter, options)
 end
 
 
-function _TARGETS:post_health(upstream, target, is_healthy)
-  local addr = utils.normalize_ip(target.target)
-  local ip   = utils.format_host(addr.host)
-  local port = addr.port
-  local _, err = balancer.post_health(upstream, ip, port, is_healthy)
+function _TARGETS:post_health(upstream_pk, target, address, is_healthy)
+  local upstream = balancer.get_upstream_by_id(upstream_pk.id)
+  local host_addr = utils.normalize_ip(target.target)
+  local hostname = utils.format_host(host_addr.host)
+  local ip
+  local port
+
+  if address ~= nil then
+    local addr = utils.normalize_ip(address)
+    ip = addr.host
+    if addr.port then
+      port = addr.port
+    else
+      port = DEFAULT_PORT
+    end
+  else
+    ip = nil
+    port = host_addr.port
+  end
+
+  local _, err = balancer.post_health(upstream, hostname, ip, port, is_healthy)
   if err then
     return nil, err
   end
 
   local health = is_healthy and 1 or 0
-  local packet = ("%s|%d|%d|%s|%s"):format(ip, port, health,
+  local packet = ("%s|%s|%d|%d|%s|%s"):format(hostname, ip or "", port, health,
                                            upstream.id,
                                            upstream.name)
 
   singletons.cluster_events:broadcast("balancer:post_health", packet)
 
   return true
+end
+
+
+function _TARGETS:get_balancer_health(upstream_pk)
+  local health_info, err = balancer.get_balancer_health(upstream_pk.id)
+  if err then
+    ngx.log(ngx.ERR, "failed getting upstream health: ", err)
+  end
+
+  return health_info
 end
 
 

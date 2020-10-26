@@ -6,6 +6,7 @@ local utils   = require "kong.tools.utils"
 for _, strategy in helpers.each_strategy() do
   describe("Plugin: key-auth (access) [#" .. strategy .. "]", function()
     local proxy_client
+    local kong_cred
 
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy, {
@@ -60,6 +61,18 @@ for _, strategy in helpers.each_strategy() do
         strip_path = true,
       }
 
+      local route8 = bp.routes:insert {
+        hosts = { "key-auth8.com" },
+      }
+
+      local route9 = bp.routes:insert {
+        hosts = { "key-auth9.com" },
+      }
+
+      local route10 = bp.routes:insert {
+        hosts = { "key-auth10.com" },
+      }
+
       bp.plugins:insert {
         name     = "key-auth",
         route = { id = route1.id },
@@ -73,7 +86,7 @@ for _, strategy in helpers.each_strategy() do
         },
       }
 
-      bp.keyauth_credentials:insert {
+      kong_cred = bp.keyauth_credentials:insert {
         key      = "kong",
         consumer = { id = consumer.id },
       }
@@ -119,6 +132,30 @@ for _, strategy in helpers.each_strategy() do
         },
       }
 
+      bp.plugins:insert {
+        name     = "key-auth",
+        route = { id = route8.id },
+        config = {
+          key_names = { "api_key", },
+        },
+      }
+
+      bp.plugins:insert {
+        name     = "key-auth",
+        route = { id = route9.id },
+        config = {
+          key_names = { "api-key", },
+        },
+      }
+
+      bp.plugins:insert {
+        name     = "key-auth",
+        route = { id = route10.id },
+        config = {
+          anonymous = anonymous_user.username,
+        },
+      }
+
       assert(helpers.start_kong({
         database   = strategy,
         nginx_conf = "spec/fixtures/custom_nginx.template",
@@ -155,7 +192,7 @@ for _, strategy in helpers.each_strategy() do
         })
         assert.res_status(401, res)
         local body = assert.res_status(401, res)
-        assert.equal([[{"message":"No API key found in request"}]], body)
+        assert.same({message = "No API key found in request"}, cjson.decode(body))
       end)
       it("returns Unauthorized on missing credentials", function()
         local res = assert(proxy_client:send {
@@ -276,26 +313,67 @@ for _, strategy in helpers.each_strategy() do
             assert.same({ message = "Invalid authentication credentials" }, json)
           end)
 
-          -- lua-multipart doesn't currently handle duplicates in the same method
-          -- that json/form-urlencoded handlers do
-          local test = type == "multipart/form-data" and pending or it
-          test("handles duplicated key", function()
-            local res = assert(proxy_client:send {
-              method  = "POST",
-              path    = "/status/200",
-              headers = {
-                ["Host"]         = "key-auth5.com",
-                ["Content-Type"] = type,
-              },
-              body = {
-                apikey = { "kong", "kong" },
-              },
-              no_array_indexes = true,
-            })
-            local body = assert.res_status(401, res)
-            local json = cjson.decode(body)
-            assert.same({ message = "Duplicate API key found" }, json)
-          end)
+          -- lua-multipart doesn't currently handle duplicates at all.
+          -- form-url encoded client will encode duplicated keys as apikey[1]=kong&apikey[2]=kong
+          if type == "application/json" then
+            it("handles duplicated key", function()
+              local res = assert(proxy_client:send {
+                method  = "POST",
+                path    = "/status/200",
+                headers = {
+                  ["Host"]         = "key-auth5.com",
+                  ["Content-Type"] = type,
+                },
+                body = {
+                  apikey = { "kong", "kong" },
+                },
+              })
+              local body = assert.res_status(401, res)
+              local json = cjson.decode(body)
+              assert.same({ message = "Duplicate API key found" }, json)
+            end)
+          end
+
+          if type == "application/x-www-form-urlencoded" then
+            it("handles duplicated key", function()
+              local res = proxy_client:post("/status/200", {
+                body = "apikey=kong&apikey=kong",
+                headers = {
+                  ["Host"]         = "key-auth5.com",
+                  ["Content-Type"] = type,
+                },
+              })
+              local body = assert.res_status(401, res)
+              local json = cjson.decode(body)
+              assert.same({ message = "Duplicate API key found" }, json)
+            end)
+
+            it("does not identify apikey[] as api keys", function()
+              local res = proxy_client:post("/status/200", {
+                body = "apikey[]=kong&apikey[]=kong",
+                headers = {
+                  ["Host"]         = "key-auth5.com",
+                  ["Content-Type"] = type,
+                },
+              })
+              local body = assert.res_status(401, res)
+              local json = cjson.decode(body)
+              assert.same({ message = "No API key found in request" }, json)
+            end)
+
+            it("does not identify apikey[1] as api keys", function()
+              local res = proxy_client:post("/status/200", {
+                body = "apikey[1]=kong&apikey[1]=kong",
+                headers = {
+                  ["Host"]         = "key-auth5.com",
+                  ["Content-Type"] = type,
+                },
+              })
+              local body = assert.res_status(401, res)
+              local json = cjson.decode(body)
+              assert.same({ message = "No API key found in request" }, json)
+            end)
+          end
         end)
       end
     end)
@@ -327,6 +405,56 @@ for _, strategy in helpers.each_strategy() do
       end)
     end)
 
+    describe("underscores or hyphens in key headers", function()
+      it("authenticates valid credentials", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Host"]   = "key-auth8.com",
+            ["api_key"] = "kong"
+          }
+        })
+        assert.res_status(200, res)
+
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Host"]   = "key-auth8.com",
+            ["api-key"] = "kong"
+          }
+        })
+        assert.res_status(200, res)
+      end)
+
+      it("returns 401 Unauthorized on invalid key", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            ["Host"]   = "key-auth8.com",
+            ["api_key"] = "123"
+          }
+        })
+        local body = assert.res_status(401, res)
+        local json = cjson.decode(body)
+        assert.same({ message = "Invalid authentication credentials" }, json)
+
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            ["Host"]   = "key-auth8.com",
+            ["api-key"] = "123"
+          }
+        })
+        body = assert.res_status(401, res)
+        json = cjson.decode(body)
+        assert.same({ message = "Invalid authentication credentials" }, json)
+      end)
+    end)
+
     describe("Consumer headers", function()
       it("sends Consumer headers to upstream", function()
         local res = assert(proxy_client:send {
@@ -340,6 +468,8 @@ for _, strategy in helpers.each_strategy() do
         local json = cjson.decode(body)
         assert.is_string(json.headers["x-consumer-id"])
         assert.equal("bob", json.headers["x-consumer-username"])
+        assert.equal(kong_cred.id, json.headers["x-credential-identifier"])
+        assert.equal(nil, json.headers["x-credential-username"])
         assert.is_nil(json.headers["x-anonymous-consumer"])
       end)
     end)
@@ -466,6 +596,8 @@ for _, strategy in helpers.each_strategy() do
         })
         local body = cjson.decode(assert.res_status(200, res))
         assert.equal('bob', body.headers["x-consumer-username"])
+        assert.equal(kong_cred.id, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
         assert.is_nil(body.headers["x-anonymous-consumer"])
       end)
       it("works with wrong credentials and anonymous", function()
@@ -474,6 +606,20 @@ for _, strategy in helpers.each_strategy() do
           path    = "/request",
           headers = {
             ["Host"] = "key-auth3.com"
+          }
+        })
+        local body = cjson.decode(assert.res_status(200, res))
+        assert.equal('true', body.headers["x-anonymous-consumer"])
+        assert.equal(nil, body.headers["x-credential-identifier"])
+        assert.equal(nil, body.headers["x-credential-username"])
+        assert.equal('no-body', body.headers["x-consumer-username"])
+      end)
+      it("works with wrong credentials and username as anonymous", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/request",
+          headers = {
+            ["Host"] = "key-auth10.com"
           }
         })
         local body = cjson.decode(assert.res_status(200, res))
@@ -507,6 +653,7 @@ for _, strategy in helpers.each_strategy() do
         "plugins",
         "consumers",
         "keyauth_credentials",
+        "basicauth_credentials",
       })
 
       local route1 = bp.routes:insert {
@@ -707,6 +854,85 @@ for _, strategy in helpers.each_strategy() do
         assert.equal(id, anonymous.id)
       end)
 
+    end)
+
+    describe("auto-expiring keys", function()
+      -- Give a bit of time to reduce test flakyness on slow setups
+      local ttl = 4
+      local inserted_at
+
+      lazy_setup(function()
+        helpers.stop_kong()
+
+        local bp = helpers.get_db_utils(strategy, {
+          "routes",
+          "services",
+          "plugins",
+          "consumers",
+          "keyauth_credentials",
+        })
+
+        local r = bp.routes:insert {
+          hosts = { "key-ttl.com" },
+        }
+
+        bp.plugins:insert {
+          name = "key-auth",
+          route = { id = r.id },
+        }
+
+        local user_jafar = bp.consumers:insert {
+          username = "Jafar",
+        }
+
+        bp.keyauth_credentials:insert({
+          key = "kong",
+          consumer = { id = user_jafar.id },
+        }, { ttl = ttl })
+
+        inserted_at = ngx.now()
+
+        assert(helpers.start_kong({
+          database   = strategy,
+          nginx_conf = "spec/fixtures/custom_nginx.template",
+        }))
+
+        proxy_client = helpers.proxy_client()
+      end)
+
+      lazy_teardown(function()
+        if proxy_client then
+          proxy_client:close()
+        end
+
+        helpers.stop_kong()
+      end)
+
+      it("authenticate for up to 'ttl'", function()
+        local res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            ["Host"] = "key-ttl.com",
+            ["apikey"] = "kong",
+          }
+        })
+        assert.res_status(200, res)
+
+        ngx.update_time()
+        local elapsed = ngx.now() - inserted_at
+        ngx.sleep(ttl - elapsed + 1) -- 1: jitter
+
+        res = assert(proxy_client:send {
+          method  = "GET",
+          path    = "/status/200",
+          headers = {
+            ["Host"] = "key-ttl.com",
+            ["apikey"] = "kong",
+          }
+        })
+        assert.res_status(401, res)
+      end)
     end)
   end)
 end

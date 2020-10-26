@@ -1,13 +1,13 @@
 [![][kong-logo]][kong-url]
 
-[![Build Status][badge-travis-image]][badge-travis-url]
+[![Build Status][badge-action-image]][badge-action-url]
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/Kong/kong/blob/master/LICENSE)
 [![Twitter](https://img.shields.io/twitter/follow/thekonginc.svg?style=social&label=Follow)](https://twitter.com/intent/follow?screen_name=thekonginc)
 
 Kong is a cloud-native, fast, scalable, and distributed Microservice
-Abstraction Layer *(also known as an API Gateway, API Middleware or in some
-cases Service Mesh)*. Made available as an open-source project in 2015, its
-core values are high performance and extensibility.
+Abstraction Layer *(also known as an API Gateway or API Middleware)*.
+Made available as an open-source project in 2015, its core values are
+high performance and extensibility.
 
 Actively maintained, Kong is widely used in production at companies ranging
 from startups to Global 5000 as well as government organizations.
@@ -38,10 +38,21 @@ transformations, and more through plugins.
 
 [![][kong-benefits]][kong-url]
 
+Kong has been built with the following leading principles:
+
+* **High Performance**: Sub-millisecond processing latency to support mission 
+  critical use cases and high throughput.
+* **Extensibility**: With a pluggable architecture to extend Kong in Lua or GoLang 
+  with Kong's Plugin SDK.
+* **Portability**: To run on every platform, every cloud and to natively support 
+  Kubernetes via our modern Ingress Controller.
+
 ## Features
 
-- **Cloud-Native**: Platform agnostic, Kong can run from bare metal to
-  Kubernetes.
+- **Cloud-Native**: Platform agnostic, Kong can run on any platform - from bare
+  metal to containers - and it can run on every cloud natively.
+- **Kubernetes-Native**: Declaratively configure Kong with native Kubernetes CRDs
+  using the official Ingress Controller to route and connect all L4 + L7 traffic. 
 - **Dynamic Load Balancing**: Load balance traffic across multiple upstream
   services.
 - **Hash-based Load Balancing**: Load balance with consistent hashing/sticky
@@ -53,10 +64,12 @@ transformations, and more through plugins.
 - **Serverless**: Invoke and secure AWS Lambda or OpenWhisk functions directly
   from Kong.
 - **WebSockets**: Communicate to your upstream services via WebSockets.
+- **gRPC**: Communicate to your gRPC services and observe your traffic with logging
+  and observability plugins
 - **OAuth2.0**: Easily add OAuth2.0 authentication to your APIs.
 - **Logging**: Log requests and responses to your system over HTTP, TCP, UDP,
   or to disk.
-- **Security**: ACL, Bot detection, whitelist/blacklist IPs, etc...
+- **Security**: ACL, Bot detection, allow/deny IPs, etc...
 - **Syslog**: Logging to System log.
 - **SSL**: Setup a Specific SSL Certificate for an underlying service or API.
 - **Monitoring**: Live monitoring provides key load and performance server
@@ -89,16 +102,20 @@ Hub](https://docs.konghq.com/hub/).
 Kong comes in many shapes. While this repository contains its core's source
 code, other repos are also under active development:
 
+- [Kubernetes Ingress Controller for Kong](https://github.com/Kong/kubernetes-ingress-controller):
+  Use Kong for Kubernetes Ingress.
 - [Kong Docker](https://github.com/Kong/docker-kong): A Dockerfile for
   running Kong in Docker.
 - [Kong Packages](https://github.com/Kong/kong/releases): Pre-built packages
   for Debian, Red Hat, and OS X distributions (shipped with each release).
+- [Kong Gojira](https://github.com/Kong/gojira): a tool for
+  testing/developing multiple versions of Kong using containers.
 - [Kong Vagrant](https://github.com/Kong/kong-vagrant): A Vagrantfile for
   provisioning a development-ready environment for Kong.
 - [Kong Homebrew](https://github.com/Kong/homebrew-kong): Homebrew Formula
   for Kong.
 - [Kong CloudFormation](https://github.com/Kong/kong-dist-cloudformation):
-  Kong in a 1-click deployment for AWS EC2
+  Kong in a 1-click deployment for AWS EC2.
 - [Kong AWS AMI](https://aws.amazon.com/marketplace/pp/B06WP4TNKL): Kong AMI on
   the AWS Marketplace.
 - [Kong on Microsoft Azure](https://github.com/Kong/kong-dist-azure): Run Kong
@@ -107,10 +124,10 @@ code, other repos are also under active development:
   Heroku in one click.
 - [Kong and Instaclustr](https://www.instaclustr.com/solutions/managed-cassandra-for-kong/): Let
   Instaclustr manage your Cassandra cluster.
-- [Kubernetes Ingress Controller for Kong](https://github.com/Kong/kubernetes-ingress-controller):
-  Use Kong for Kubernetes Ingress.
 - [Nightly Builds][kong-nightly-master]: Builds of the master branch available
   every morning at about 9AM PST.
+
+You can find every supported distribution at the [official installation page](https://konghq.com/install/).
 
 ## Development
 
@@ -126,6 +143,15 @@ Kit (PDK) Reference](https://docs.konghq.com/latest/pdk/).
 
 You can use Docker / docker-compose and a mounted volume to develop Kong by
 following the instructions on [Kong/kong-build-tools](https://github.com/Kong/kong-build-tools#developing-kong).
+
+#### Kong Gojira
+
+[Gojira](https://github.com/Kong/gojira) is a CLI that uses docker-compose
+internally to make the necessary setup of containers to get all
+dependencies needed to run a particular branch of Kong locally, as well
+as easily switching across versions, configurations and dependencies. It
+has support for running Kong in Hybrid (CP/DP) mode, testing migrations,
+running a Kong cluster, among other [features](https://github.com/Kong/gojira/blob/master/doc/manual.md).
 
 #### Vagrant
 
@@ -241,7 +267,7 @@ Enterprise](https://konghq.com/kong-enterprise-edition/).
 ## License
 
 ```
-Copyright 2016-2019 Kong Inc.
+Copyright 2016-2020 Kong Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -260,8 +286,8 @@ limitations under the License.
 [kong-logo]: https://konghq.com/wp-content/uploads/2018/05/kong-logo-github-readme.png
 [kong-benefits]: https://konghq.com/wp-content/uploads/2018/05/kong-benefits-github-readme.png
 [kong-nightly-master]: https://bintray.com/kong/kong-nightly/master
-[badge-travis-url]: https://travis-ci.org/Kong/kong/branches
-[badge-travis-image]: https://travis-ci.org/Kong/kong.svg?branch=master
+[badge-action-url]: https://github.com/Kong/kong/actions
+[badge-action-image]: https://github.com/Kong/kong/workflows/Build%20&%20Test/badge.svg
 
 [busted]: https://github.com/Olivine-Labs/busted
 [luacheck]: https://github.com/mpeterv/luacheck

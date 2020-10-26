@@ -188,7 +188,7 @@ describe("kong start/stop #" .. strategy, function()
     end)
   end)
 
-  describe("nginx_daemon = off", function()
+  describe("nginx_main_daemon = off", function()
     it("redirects nginx's stdout to 'kong start' stdout", function()
       local pl_utils = require "pl.utils"
       local pl_file = require "pl.file"
@@ -200,7 +200,7 @@ describe("kong start/stop #" .. strategy, function()
       end)
 
       local cmd = string.format("KONG_PROXY_ACCESS_LOG=/dev/stdout "    ..
-                                "KONG_NGINX_DAEMON=off %s start -c %s " ..
+                                "KONG_NGINX_MAIN_DAEMON=off %s start -c %s " ..
                                 ">%s 2>/dev/null &", helpers.bin_path,
                                 helpers.test_conf_path, stdout_path)
 
@@ -209,23 +209,60 @@ describe("kong start/stop #" .. strategy, function()
         error(stderr)
       end
 
-      do
-        local proxy_client
+      helpers.wait_until(function()
+        local cmd = string.format("%s health -p ./servroot", helpers.bin_path)
+        return pl_utils.executeex(cmd)
+      end, 10)
 
-        -- get a connection, retry until kong starts
-        helpers.wait_until(function()
-          local pok
-          pok, proxy_client = pcall(helpers.proxy_client)
-          return pok
-        end, 10)
+      local proxy_client = assert(helpers.proxy_client())
 
-        local res = assert(proxy_client:send {
-          method = "GET",
-          path = "/hello",
-        })
-        assert.res_status(404, res) -- no Route configured
+      local res = assert(proxy_client:send {
+        method = "GET",
+        path = "/hello",
+      })
+      assert.res_status(404, res) -- no Route configured
+      assert(helpers.stop_kong(helpers.test_conf.prefix))
+
+      -- TEST: since nginx started in the foreground, the 'kong start' command
+      -- stdout should receive all of nginx's stdout as well.
+      local stdout = pl_file.read(stdout_path)
+      assert.matches([["GET /hello HTTP/1.1" 404]] , stdout, nil, true)
+    end)
+  end)
+
+  describe("nginx_main_daemon = off #flaky on Travis", function()
+    it("redirects nginx's stdout to 'kong start' stdout", function()
+      local pl_utils = require "pl.utils"
+      local pl_file = require "pl.file"
+
+      local stdout_path = os.tmpname()
+
+      finally(function()
+        os.remove(stdout_path)
+      end)
+
+      local cmd = string.format("KONG_PROXY_ACCESS_LOG=/dev/stdout "    ..
+                                "KONG_NGINX_MAIN_DAEMON=off %s start -c %s " ..
+                                ">%s 2>/dev/null &", helpers.bin_path,
+                                helpers.test_conf_path, stdout_path)
+
+      local ok, _, _, stderr = pl_utils.executeex(cmd)
+      if not ok then
+        error(stderr)
       end
 
+      helpers.wait_until(function()
+        local cmd = string.format("%s health -p ./servroot", helpers.bin_path)
+        return pl_utils.executeex(cmd)
+      end, 10)
+
+      local proxy_client = assert(helpers.proxy_client())
+
+      local res = assert(proxy_client:send {
+        method = "GET",
+        path = "/hello",
+      })
+      assert.res_status(404, res) -- no Route configured
       assert(helpers.stop_kong(helpers.test_conf.prefix))
 
       -- TEST: since nginx started in the foreground, the 'kong start' command
@@ -365,6 +402,24 @@ describe("kong start/stop #" .. strategy, function()
           dict .. " [SIZE];' directive is defined.", err, nil, true)
       end
     end)
+    it("ensures lua-resty-core is loaded", function()
+        finally(function()
+          helpers.stop_kong()
+        end)
+
+        local ok, err = helpers.start_kong({
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          nginx_http_lua_load_resty_core = "off",
+        })
+        assert.falsy(ok)
+        assert.matches(helpers.unindent([[
+          lua-resty-core must be loaded; make sure 'lua_load_resty_core'
+          is not disabled.
+        ]], nil, true), err, nil, true)
+    end)
 
     if strategy == "cassandra" then
       it("errors when cassandra contact points cannot be resolved", function()
@@ -420,11 +475,132 @@ describe("kong start/stop #" .. strategy, function()
               in 'routes':
                 - in entry 1 of 'routes':
                   in 'hosts':
-                    - in entry 2 of 'hosts': invalid value: \\99
+                    - in entry 2 of 'hosts': invalid hostname: \\99
         ]], err, nil, true)
       end)
     end
 
+  end)
+
+  describe("deprecated properties", function()
+    describe("prints a warning to stderr", function()
+      local u = helpers.unindent
+
+      local function check_warn(opts, deprecated, replacement)
+        local kopts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+        }
+
+        for k, v in pairs(opts) do
+          kopts[k] = v
+        end
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", kopts))
+        assert.matches("Kong started", stdout, nil, true)
+
+        if replacement then
+          assert.matches(u([[
+            [warn] the ']] .. deprecated .. [[' configuration property is
+            deprecated, use ']] .. replacement .. [[' instead
+          ]], nil, true), stderr, nil, true)
+
+        else
+          assert.matches(u([[
+            [warn] the ']] .. deprecated .. [[' configuration property is
+            deprecated
+          ]], nil, true), stderr, nil, true)
+        end
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", kopts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end
+
+      it("nginx_optimizations", function()
+        check_warn({
+          nginx_optimizations = true,
+        }, "nginx_optimizations")
+      end)
+
+      it("client_max_body_size", function()
+        check_warn({
+          client_max_body_size = "16k",
+        }, "client_max_body_size", "nginx_http_client_max_body_size")
+      end)
+
+      it("client_body_buffer_size", function()
+        check_warn({
+          client_body_buffer_size = "16k",
+        }, "client_body_buffer_size", "nginx_http_client_body_buffer_size")
+      end)
+
+      it("upstream_keepalive", function()
+        check_warn({
+          upstream_keepalive = 10,
+        }, "upstream_keepalive", "upstream_keepalive_pool_size")
+      end)
+
+      it("nginx_http_upstream_keepalive", function()
+        check_warn({
+          nginx_http_upstream_keepalive = 10,
+        }, "nginx_http_upstream_keepalive", "upstream_keepalive_pool_size")
+      end)
+
+      it("nginx_http_upstream_keepalive_requests", function()
+        check_warn({
+          nginx_http_upstream_keepalive_requests = 50,
+        }, "nginx_http_upstream_keepalive_requests", "upstream_keepalive_max_requests")
+      end)
+
+      it("nginx_http_upstream_keepalive_timeout", function()
+        check_warn({
+          nginx_http_upstream_keepalive_timeout = "30s",
+        }, "nginx_http_upstream_keepalive_timeout", "upstream_keepalive_idle_timeout")
+      end)
+
+      it("nginx_upstream_keepalive", function()
+        check_warn({
+          nginx_upstream_keepalive = 10,
+        }, "nginx_upstream_keepalive", "upstream_keepalive_pool_size")
+      end)
+
+      it("nginx_upstream_keepalive_requests", function()
+        check_warn({
+          nginx_upstream_keepalive_requests = 10,
+        }, "nginx_upstream_keepalive_requests", "upstream_keepalive_max_requests")
+      end)
+
+      it("nginx_upstream_keepalive_timeout", function()
+        check_warn({
+          nginx_upstream_keepalive_timeout = "30s",
+        }, "nginx_upstream_keepalive_timeout", "upstream_keepalive_idle_timeout")
+      end)
+
+      it("'cassandra_consistency'", function()
+        local opts = {
+          prefix = helpers.test_conf.prefix,
+          database = helpers.test_conf.database,
+          pg_database = helpers.test_conf.pg_database,
+          cassandra_keyspace = helpers.test_conf.cassandra_keyspace,
+          cassandra_consistency = "LOCAL_ONE",
+        }
+
+        local _, stderr, stdout = assert(helpers.kong_exec("start", opts))
+        assert.matches("Kong started", stdout, nil, true)
+        assert.matches(u([[
+          [warn] the 'cassandra_consistency' configuration property is
+          deprecated, use 'cassandra_write_consistency / cassandra_read_consistency'
+          instead
+        ]], nil, true), stderr, nil, true)
+
+        local _, stderr, stdout = assert(helpers.kong_exec("stop", opts))
+        assert.matches("Kong stopped", stdout, nil, true)
+        assert.equal("", stderr)
+      end)
+    end)
   end)
 end)
 

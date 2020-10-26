@@ -25,6 +25,18 @@ qq{
     }
 
     init_worker_by_lua_block {
+        local ssl = require("ngx.ssl")
+
+        local f = assert(io.open("t/certs/test.crt"))
+        local cert_data = f:read("*a")
+        f:close()
+
+        local chain = assert(ssl.parse_pem_cert(cert_data))
+
+        f = assert(io.open("t/certs/test.key"))
+        local key_data = f:read("*a")
+        f:close()
+        local key = assert(ssl.parse_pem_priv_key(key_data))
 
         -- mock kong.runloop.balancer
         package.loaded["kong.runloop.balancer"] = {
@@ -60,6 +72,50 @@ qq{
                 header_filter = "forced false",
                 body_filter   = "forced false",
                 log           = "forced false",
+                admin_api     = "forced false",
+            }, {
+                method        = "set_tls_cert_key",
+                args          = { chain, key, },
+                init_worker   = false,
+                certificate   = "pending",
+                rewrite       = true,
+                access        = true,
+                header_filter = false,
+                body_filter   = false,
+                log           = false,
+                admin_api     = "forced false",
+            }, {
+                method        = "set_tls_verify",
+                args          = { true, },
+                init_worker   = false,
+                certificate   = "pending",
+                rewrite       = true,
+                access        = true,
+                header_filter = false,
+                body_filter   = false,
+                log           = false,
+                admin_api     = "forced false",
+            }, {
+                method        = "set_tls_verify_depth",
+                args          = { 2, },
+                init_worker   = false,
+                certificate   = "pending",
+                rewrite       = true,
+                access        = true,
+                header_filter = false,
+                body_filter   = false,
+                log           = false,
+                admin_api     = "forced false",
+            }, {
+                method        = "set_tls_verify_store",
+                args          = { require("resty.openssl.x509.store").new(), },
+                init_worker   = false,
+                certificate   = "pending",
+                rewrite       = true,
+                access        = true,
+                header_filter = false,
+                body_filter   = false,
+                log           = false,
                 admin_api     = "forced false",
             },
         }

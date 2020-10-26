@@ -3,6 +3,8 @@ local utils = require "kong.tools.utils"
 local DAO = require "kong.db.dao"
 local plugin_loader = require "kong.db.schema.plugin_loader"
 local BasePlugin = require "kong.plugins.base_plugin"
+local go = require "kong.db.dao.plugins.go"
+local reports = require "kong.reports"
 
 
 local Plugins = {}
@@ -93,7 +95,7 @@ end
 
 
 function Plugins:update(primary_key, entity, options)
-  local rbw_entity = self.strategy:select(primary_key, options) -- ignore errors
+  local rbw_entity = self.super.select(self, primary_key, options) -- ignore errors
   if rbw_entity then
     entity = self.schema:merge_values(entity, rbw_entity)
   end
@@ -107,10 +109,6 @@ end
 
 
 function Plugins:upsert(primary_key, entity, options)
-  local rbw_entity = self.strategy:select(primary_key, options) -- ignore errors
-  if rbw_entity then
-    entity = self.schema:merge_values(entity, rbw_entity)
-  end
   local ok, err, err_t = check_protocols_match(self, entity)
   if not ok then
     return nil, err, err_t
@@ -126,7 +124,7 @@ function Plugins:check_db_against_config(plugin_set)
   local in_db_plugins = {}
   ngx_log(ngx_DEBUG, "Discovering used plugins")
 
-  for row, err in self:each(1000) do
+  for row, err in self:each() do
     if err then
       return nil, tostring(err)
     end
@@ -149,6 +147,12 @@ local function load_plugin_handler(plugin)
 
   local plugin_handler = "kong.plugins." .. plugin .. ".handler"
   local ok, handler = utils.load_module_if_exists(plugin_handler)
+  if not ok and go.is_on() then
+      ok, handler = go.load_plugin(plugin)
+      if type(handler) == "table" then
+        handler._go = true
+      end
+  end
   if not ok then
     return nil, plugin .. " plugin is enabled but not installed;\n" .. handler
   end
@@ -230,14 +234,18 @@ local function load_plugin(self, plugin)
     return nil, err
   end
 
-  if schema.fields.consumer and schema.fields.consumer.eq == null then
-    plugin.no_consumer = true
-  end
-  if schema.fields.route and schema.fields.route.eq == null then
-    plugin.no_route = true
-  end
-  if schema.fields.service and schema.fields.service.eq == null then
-    plugin.no_service = true
+  for _, field in ipairs(schema.fields) do
+    if field.consumer and field.consumer.eq == null then
+      handler.no_consumer = true
+    end
+
+    if field.route and field.route.eq == null then
+      handler.no_route = true
+    end
+
+    if field.service and field.service.eq == null then
+      handler.no_service = true
+    end
   end
 
   ngx_log(ngx_DEBUG, "Loading plugin: ", plugin)
@@ -262,6 +270,7 @@ end
 function Plugins:load_plugin_schemas(plugin_set)
   self.handlers = nil
 
+  local go_plugins_cnt = 0
   local handlers = {}
   local errs
 
@@ -277,6 +286,10 @@ function Plugins:load_plugin_schemas(plugin_set)
         handler = handler()
       end
 
+      if handler._go then
+        go_plugins_cnt = go_plugins_cnt + 1
+      end
+
       handlers[plugin] = handler
 
     else
@@ -288,6 +301,8 @@ function Plugins:load_plugin_schemas(plugin_set)
   if errs then
     return nil, "error loading plugin schemas: " .. table.concat(errs, "; ")
   end
+
+  reports.add_immutable_value("go_plugins_cnt", go_plugins_cnt)
 
   self.handlers = handlers
 
@@ -316,15 +331,6 @@ end
 
 
 function Plugins:select_by_cache_key(key)
-  local schema_state = assert(self.db:last_schema_state())
-
-  -- if migration is complete, disable this translator function
-  -- and use the regular function
-  if schema_state:is_migration_executed("core", "001_14_to_15") then
-    self.select_by_cache_key = self.super.select_by_cache_key
-    Plugins.select_by_cache_key = nil
-    return self.super.select_by_cache_key(self, key)
-  end
 
   -- first try new way
   local entity, new_err = self.super.select_by_cache_key(self, key)
@@ -335,23 +341,24 @@ function Plugins:select_by_cache_key(key)
     local schema_state = assert(self.db:schema_state())
 
     -- if migration is complete, disable this translator function and return
-    if schema_state:is_migration_executed("core", "001_14_to_15") then
-      self.select_by_cache_key = self.super.select_by_cache_key
-      Plugins.select_by_cache_key = nil
+    if schema_state:is_migration_executed("core", "009_200_to_210") then
+      Plugins.select_by_cache_key = self.super.select_by_cache_key
       return entity
     end
   end
 
+  key = key:sub(1, -38) -- strip ":<ws_id>" from the end
+
   -- otherwise, we either have not started migrating, or we're migrating but
   -- the plugin identified by key doesn't have a cache_key yet
   -- do things "the old way" in both cases
-  local row, old_err = self.strategy:select_by_cache_key_migrating(key)
+  local row, old_err = self.super.select_by_cache_key(self, key)
   if row then
     return self:row_to_entity(row)
   end
 
   -- when both ways have failed, return the "new" error message.
-  -- otherwise, return whichever error is not-nil
+  -- otherwise, only return an error if the "old" version failed.
   local err = (new_err and old_err) and new_err or old_err
 
   return nil, err

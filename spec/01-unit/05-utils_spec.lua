@@ -226,14 +226,23 @@ describe("Utils", function()
         assert.equal("b=false", str)
       end)
       it("should encode complex query args", function()
-        local str = utils.encode_args {
-          array = {"hello, world"},
-          hash = { answer = 42 },
-          hello = "world",
-          falsy = false,
-          ["multiple values"] = true
-        }
-        assert.equal("array%5b1%5d=hello%2c%20world&falsy=false&hash%2eanswer=42&hello=world&multiple%20values=true", str)
+        local encode = utils.encode_args
+        assert.equal("falsy=false",
+                     encode({ falsy = false }))
+        assert.equal("multiple%20values=true",
+                     encode({ ["multiple values"] = true }))
+        assert.equal("array%5b1%5d=hello%2c%20world",
+                     encode({ array = {"hello, world"} }))
+        assert.equal("hash%2eanswer=42",
+                     encode({ hash = { answer = 42 } }))
+        assert.equal("hash_array%2earr%5b1%5d=one&hash_array%2earr%5b2%5d=two",
+                     encode({ hash_array = { arr = { "one", "two" } } }))
+        assert.equal("array_hash%5b1%5d%2ename=peter",
+                     encode({ array_hash = { { name = "peter" } } }))
+        assert.equal("array_array%5b1%5d%5b1%5d=x&array_array%5b1%5d%5b2%5d=y",
+                     encode({ array_array = { { "x", "y" } } }))
+        assert.equal("hybrid%5b1%5d=1&hybrid%5b2%5d=2&hybrid%2en=3",
+                     encode({ hybrid = { 1, 2, n = 3 } }))
       end)
       it("should not interpret the `%` character followed by 2 characters in the [0-9a-f] group as an hexadecimal value", function()
         local str = utils.encode_args {
@@ -241,12 +250,56 @@ describe("Utils", function()
         }
         assert.equal("foo=%25bar%25", str)
       end)
-      it("should not percent-encode if given a `raw` option", function()
+      it("does not percent-encode if given a `raw` option", function()
+        local encode = utils.encode_args
         -- this is useful for kong.tools.http_client
-        local str = utils.encode_args({
-          ["hello world"] = "foo, bar"
-        }, true)
-        assert.equal("hello world=foo, bar", str)
+        assert.equal("hello world=foo, bar",
+                     encode({ ["hello world"] = "foo, bar" }, true))
+        assert.equal("hash.answer=42",
+                     encode({ hash = { answer = 42 } }, true))
+        assert.equal("hash_array.arr[1]=one&hash_array.arr[2]=two",
+                     encode({ hash_array = { arr = { "one", "two" } } }, true))
+        assert.equal("array_hash[1].name=peter",
+                     encode({ array_hash = { { name = "peter" } } }, true))
+        assert.equal("array_array[1][1]=x&array_array[1][2]=y",
+                     encode({ array_array = { { "x", "y" } } }, true))
+        assert.equal("hybrid[1]=1&hybrid[2]=2&hybrid.n=3",
+                     encode({ hybrid = { 1, 2, n = 3 } }, true))
+      end)
+      it("does not include index numbers in arrays if given the `no_array_indexes` flag", function()
+        local encode = utils.encode_args
+        assert.equal("falsy=false",
+                     encode({ falsy = false }, nil, true))
+        assert.equal("multiple%20values=true",
+                     encode({ ["multiple values"] = true }, nil, true))
+        assert.equal("array%5b%5d=hello%2c%20world",
+                     encode({ array = {"hello, world"} }, nil, true))
+        assert.equal("hash%2eanswer=42",
+                     encode({ hash = { answer = 42 } }, nil, true))
+        assert.equal("hash_array%2earr%5b%5d=one&hash_array%2earr%5b%5d=two",
+                     encode({ hash_array = { arr = { "one", "two" } } }, nil, true))
+        assert.equal("array_hash%5b%5d%2ename=peter",
+                     encode({ array_hash = { { name = "peter" } } }, nil, true))
+        assert.equal("array_array%5b%5d%5b%5d=x&array_array%5b%5d%5b%5d=y",
+                     encode({ array_array = { { "x", "y" } } }, nil, true))
+        assert.equal("hybrid%5b%5d=1&hybrid%5b%5d=2&hybrid%2en=3",
+                     encode({ hybrid = { 1, 2, n = 3 } }, nil, true))
+      end)
+      it("does not percent-encode and does not add index numbers if both `raw` and `no_array_indexes` are active", function()
+        local encode = utils.encode_args
+        -- this is useful for kong.tools.http_client
+        assert.equal("hello world=foo, bar",
+                     encode({ ["hello world"] = "foo, bar" }, true, true))
+        assert.equal("hash.answer=42",
+                     encode({ hash = { answer = 42 } }, true, true))
+        assert.equal("hash_array.arr[]=one&hash_array.arr[]=two",
+                     encode({ hash_array = { arr = { "one", "two" } } }, true, true))
+        assert.equal("array_hash[].name=peter",
+                     encode({ array_hash = { { name = "peter" } } }, true, true))
+        assert.equal("array_array[][]=x&array_array[][]=y",
+                     encode({ array_array = { { "x", "y" } } }, true, true))
+        assert.equal("hybrid[]=1&hybrid[]=2&hybrid.n=3",
+                     encode({ hybrid = { 1, 2, n = 3 } }, true, true))
       end)
       it("transforms ngx.null into empty string", function()
         local str = utils.encode_args({ x = ngx.null, y = "foo" })
@@ -366,10 +419,11 @@ describe("Utils", function()
         assert.False(loaded)
         assert.is.string(mod)
       end)
-      it("should throw an error if the module is invalid", function()
-        assert.has.errors(function()
-          utils.load_module_if_exists("spec.fixtures.invalid-module")
-        end)
+      it("should throw an error with a traceback if the module is invalid", function()
+        local pok, perr = pcall(utils.load_module_if_exists, "spec.fixtures.invalid-module")
+        assert.falsy(pok)
+        assert.match("error loading module 'spec.fixtures.invalid-module'", perr, 1, true)
+        assert.match("./spec/fixtures/invalid-module.lua:", perr, 1, true)
       end)
       it("should load a module if it was found and valid", function()
         local loaded, mod
@@ -620,6 +674,80 @@ describe("Utils", function()
       assert.has_error(function()
         utils.bytes_to_str(1234, "k", "")
       end, "scale must be equal or greater than 0")
+    end)
+  end)
+
+  describe("gzip_[de_in]flate()", function()
+    it("empty string", function()
+      local gz = assert(utils.deflate_gzip(""))
+      assert.equal(utils.inflate_gzip(gz), "")
+    end)
+
+    it("small string (< 1 buffer)", function()
+      local gz = assert(utils.deflate_gzip("aabbccddeeffgg"))
+      assert.equal(utils.inflate_gzip(gz), "aabbccddeeffgg")
+    end)
+
+    it("long string (> 1 buffer)", function()
+      local s = string.rep("a", 70000) -- > 64KB
+
+      local gz = assert(utils.deflate_gzip(s))
+
+      assert(#gz < #s)
+
+      assert.equal(utils.inflate_gzip(gz), s)
+    end)
+
+    it("bad gzipped data", function()
+      local res, err = utils.inflate_gzip("bad")
+      assert.is_nil(res)
+      assert.equal(err, "INFLATE: data error")
+    end)
+  end)
+
+  describe("get_mime_type()", function()
+    it("with valid mime types", function()
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("application/json"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("application/json; charset=utf-8"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("application/*"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("application/*; charset=utf-8"))
+      assert.equal("text/html; charset=utf-8", utils.get_mime_type("text/html"))
+      assert.equal("text/plain; charset=utf-8", utils.get_mime_type("text/plain"))
+      assert.equal("text/plain; charset=utf-8", utils.get_mime_type("text/*"))
+      assert.equal("text/plain; charset=utf-8", utils.get_mime_type("text/*; charset=utf-8"))
+      assert.equal("application/xml; charset=utf-8", utils.get_mime_type("application/xml"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("*/*; charset=utf-8"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("*/*"))
+      assert.equal("", utils.get_mime_type("application/grpc"))
+    end)
+
+    it("with unsupported or invalid mime types", function()
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("audio/*", true))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("text/css"))
+      assert.equal("application/json; charset=utf-8", utils.get_mime_type("default"))
+      assert.is_nil(utils.get_mime_type("video/json", false))
+      assert.is_nil(utils.get_mime_type("text/javascript", false))
+    end)
+  end)
+
+  describe("nginx_conf_time_to_seconds()", function()
+    it("returns value in seconds", function()
+      assert.equal(5, utils.nginx_conf_time_to_seconds("5"))
+      assert.equal(5, utils.nginx_conf_time_to_seconds("5s"))
+      assert.equal(60, utils.nginx_conf_time_to_seconds("60s"))
+      assert.equal(60, utils.nginx_conf_time_to_seconds("1m"))
+      assert.equal(120, utils.nginx_conf_time_to_seconds("2m"))
+      assert.equal(7200, utils.nginx_conf_time_to_seconds("2h"))
+      assert.equal(172800, utils.nginx_conf_time_to_seconds("2d"))
+      assert.equal(1209600, utils.nginx_conf_time_to_seconds("2w"))
+      assert.equal(5184000, utils.nginx_conf_time_to_seconds("2M"))
+      assert.equal(63072000, utils.nginx_conf_time_to_seconds("2y"))
+    end)
+
+    it("throws an error on bad argument", function()
+      assert.has_error(function()
+        utils.nginx_conf_time_to_seconds("abcd")
+      end, "bad argument #1 'str'")
     end)
   end)
 end)

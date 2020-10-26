@@ -10,6 +10,7 @@ local re_find      = ngx.re.find
 local concat       = table.concat
 local insert       = table.insert
 local format       = string.format
+local unpack       = unpack
 local assert       = assert
 local ipairs       = ipairs
 local pairs        = pairs
@@ -30,6 +31,7 @@ Schema.__index     = Schema
 
 
 local _cache = {}
+local _workspaceable = {}
 
 
 local new_tab
@@ -112,6 +114,8 @@ local validation_errors = {
   SUBSCHEMA_BAD_TYPE        = "error in definition of '%s': %s: cannot change type in a specialized field",
   SUBSCHEMA_BAD_FIELD       = "error in definition of '%s': %s: cannot create a new field",
   SUBSCHEMA_ABSTRACT_FIELD  = "error in schema definition: abstract field was not specialized",
+  -- transformations
+  TRANSFORMATION_ERROR      = "transformation failed: %s",
 }
 
 
@@ -145,6 +149,26 @@ local function make_length_validator(err, fn)
     end
     return nil, validation_errors[err]:format(n)
   end
+end
+
+
+--- Produce a nicely quoted list:
+-- Given `{"foo", "bar", "baz"}` and `"or"`, produces
+-- `"'foo', 'bar', 'baz'"`.
+-- Given an array of arrays (e.g., `{{"f1", "f2"}, {"f3", "f4"}}`), produces
+-- `"('f1', 'f2'), ('f3', 'f4')"`.
+-- @param words an array of strings and/or arrays of strings.
+-- @return The string of quoted words and/or arrays.
+local function quoted_list(words)
+  local msg = {}
+  for _, word in ipairs(words) do
+    if type(word) == "table" then
+      insert(msg, ("(%s)"):format(quoted_list(word)))
+    else
+      insert(msg, ("'%s'"):format(word))
+    end
+  end
+  return concat(msg, ", ")
 end
 
 
@@ -303,6 +327,30 @@ Schema.validators = {
     return nil, validation_errors.CONTAINS:format(wanted)
   end,
 
+  mutually_exclusive_subsets = function(value, subsets)
+    local subset_union = {} -- union of all subsets; key is an element, value is the
+    for _, subset in ipairs(subsets) do -- the subset the element is part of
+      for _, el in ipairs(subset) do
+        subset_union[el] = subset
+      end
+    end
+
+    local member_of = {}
+
+    for _, val in ipairs(value) do -- for each value, add the set it's part of
+      if subset_union[val] and not member_of[subset_union[val]] then -- to member_of, iff it hasn't already
+        member_of[subset_union[val]] = true
+        member_of[#member_of+1] = subset_union[val]
+      end
+    end
+
+    if #member_of <= 1 then
+      return true
+    else
+      return nil, validation_errors.MUTUALLY_EXCLUSIVE_SETS:format(quoted_list(member_of))
+    end
+  end,
+
   custom_validator = function(value, fn)
     return fn(value)
   end
@@ -341,6 +389,7 @@ Schema.validators_order = {
 
   -- other
   "custom_validator",
+  "mutually_exclusive_subsets",
 }
 
 
@@ -390,25 +439,11 @@ local function is_sequence(t)
 end
 
 
---- Produce a nicely quoted list:
--- Given `{"foo", "bar", "baz"}` and `"or"`, produces
--- `"'foo', 'bar', 'baz'"`.
--- @param words an array of strings.
--- @return The string of quoted words.
-local function quoted_list(words)
-  local msg = {}
-  for _, word in ipairs(words) do
-    insert(msg, ("'%s'"):format(word))
-  end
-  return concat(msg, ", ")
-end
-
-
 -- Get a field from a possibly-nested table using a string key
 -- such as "x.y.z", such that `get_field(t, "x.y.z")` is the
 -- same as `t.x.y.z`.
 local function get_field(tbl, name)
-  if tbl == nil then
+  if tbl == nil or tbl == null then
     return nil
   end
   local dot = find(name, ".", 1, true)
@@ -452,6 +487,23 @@ local function get_schema_field(schema, name)
   end
   local hd, tl = sub(name, 1, dot - 1), sub(name, dot + 1)
   return get_schema_field(schema.fields[hd], tl)
+end
+
+
+local function mutually_required(entity, field_names)
+  local nonempty = {}
+
+  for _, name in ipairs(field_names) do
+    if is_nonempty(get_field(entity, name)) then
+      insert(nonempty, name)
+    end
+  end
+
+  if #nonempty == 0 or #nonempty == #field_names then
+    return true
+  end
+
+  return nil, quoted_list(field_names)
 end
 
 
@@ -679,21 +731,7 @@ Schema.entity_checkers = {
 
   mutually_required = {
     run_with_missing_fields = true,
-    fn = function(entity, field_names)
-      local nonempty = {}
-
-      for _, name in ipairs(field_names) do
-        if is_nonempty(get_field(entity, name)) then
-          insert(nonempty, name)
-        end
-      end
-
-      if #nonempty == 0 or #nonempty == #field_names then
-        return true
-      end
-
-      return nil, quoted_list(field_names)
-    end
+    fn = mutually_required,
   },
 
   mutually_exclusive_sets = {
@@ -781,7 +819,7 @@ function Schema:validate_field(field, value)
 
   if value == null then
     if field.ne == null then
-      return nil, validation_errors.NE:format("null")
+      return nil, field.err or validation_errors.NE:format("null")
     end
     if field.eq ~= nil and field.eq ~= null then
       return nil, validation_errors.EQ:format(tostring(field.eq))
@@ -793,7 +831,7 @@ function Schema:validate_field(field, value)
   end
 
   if field.eq == null then
-    return nil, validation_errors.EQ:format("null")
+    return nil, field.err or validation_errors.EQ:format("null")
   end
 
   if field.abstract then
@@ -908,7 +946,7 @@ function Schema:validate_field(field, value)
           err = (validation_errors[k:upper()]
                  or validation_errors.VALIDATION):format(value)
         end
-        return nil, err
+        return nil, field.err or err
       end
     end
   end
@@ -921,8 +959,9 @@ end
 -- fill its slot in `entity` with an appropriate default value,
 -- if possible.
 -- @param field The field definition table.
-local function handle_missing_field(field, value)
-  if field.default ~= nil then
+local function handle_missing_field(field, value, opts)
+  local no_defaults = opts and opts.no_defaults
+  if field.default ~= nil and not no_defaults then
     local copy = tablex.deepcopy(field.default)
     if (field.type == "array" or field.type == "set")
       and type(copy) == "table"
@@ -981,9 +1020,19 @@ end
 
 local function get_subschema(self, input)
   if self.subschemas and self.subschema_key then
-    local subschema = self.subschemas[input[self.subschema_key]]
-    if subschema then
-      return self.subschemas[input[self.subschema_key]]
+    local input_key = input[self.subschema_key]
+
+    if type(input_key) == "string" then
+      return self.subschemas[input_key]
+    end
+
+    if type(input_key) == "table" then  -- if subschema key is a set, return
+      for _, v in ipairs(input_key) do  -- subschema for first key
+        local subschema = self.subschemas[v]
+        if subschema then
+          return subschema
+        end
+      end
     end
   end
   return nil
@@ -1022,6 +1071,7 @@ validate_fields = function(self, input)
   for k, v in pairs(input) do
     local err
     local field = self.fields[tostring(k)]
+    local is_ttl = k == "ttl" and self.ttl
     if field and field.type == "self" then
       local pok
       pok, err, errors[k] = pcall(self.validate_field, self, input, v)
@@ -1029,6 +1079,8 @@ validate_fields = function(self, input)
         errors[k] = validation_errors.SCHEMA_CANNOT_VALIDATE
         kong.log.debug(errors[k], ": ", err)
       end
+    elseif is_ttl then
+      kong.log.debug("ignoring validation on ttl field")
     else
       field, err = resolve_field(self, k, field, subschema)
       if field then
@@ -1252,6 +1304,57 @@ do
   end
 end
 
+
+local function run_transformation_checks(self, input, original_input, rbw_entity, errors)
+  if not self.transformations then
+    return
+  end
+
+  for _, transformation in ipairs(self.transformations) do
+    local args = {}
+    local argc = 0
+    local none_set = true
+    for _, input_field_name in ipairs(transformation.input) do
+      if is_nonempty(get_field(original_input or input, input_field_name)) then
+        none_set = false
+      end
+
+      argc = argc + 1
+      args[argc] = input_field_name
+    end
+
+    local needs_changed = false
+    if transformation.needs then
+      for _, input_field_name in ipairs(transformation.needs) do
+        if rbw_entity and not needs_changed then
+          local value = get_field(original_input or input, input_field_name)
+          local rbw_value = get_field(rbw_entity, input_field_name)
+          if value ~= rbw_value then
+            needs_changed = true
+          end
+        end
+
+        argc = argc + 1
+        args[argc] = input_field_name
+      end
+    end
+
+    if needs_changed or (not none_set) then
+      local ok, err = mutually_required(needs_changed and original_input or input, args)
+      if not ok then
+        insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+
+      else
+        ok, err = mutually_required(original_input or input, transformation.input)
+        if not ok then
+          insert_entity_error(errors, validation_errors.MUTUALLY_REQUIRED:format(err))
+        end
+      end
+    end
+  end
+end
+
+
 --- Ensure that a given table contains only the primary-key
 -- fields of the entity and that their fields validate.
 -- @param pk A table with primary-key fields only.
@@ -1369,9 +1472,9 @@ local function should_recurse_record(context, value, field)
 end
 
 
-local function adjust_field_for_context(field, value, context, nulls)
+local function adjust_field_for_context(field, value, context, nulls, opts)
   if context == "select" and value == null and field.required == true then
-    return handle_missing_field(field, value)
+    return handle_missing_field(field, value, opts)
   end
 
   if field.abstract then
@@ -1380,10 +1483,10 @@ local function adjust_field_for_context(field, value, context, nulls)
 
   if field.type == "record" then
     if should_recurse_record(context, value, field) then
-      value = value or handle_missing_field(field, value)
+      value = value or handle_missing_field(field, value, opts)
       if type(value) == "table" then
         local field_schema = get_field_schema(field)
-        return field_schema:process_auto_fields(value, context, nulls)
+        return field_schema:process_auto_fields(value, context, nulls, opts)
       end
     end
 
@@ -1403,13 +1506,13 @@ local function adjust_field_for_context(field, value, context, nulls)
 
     if subfield then
       for i, e in ipairs(value) do
-        value[i] = adjust_field_for_context(subfield, e, context, nulls)
+        value[i] = adjust_field_for_context(subfield, e, context, nulls, opts)
       end
     end
   end
 
   if value == nil and context ~= "update" then
-    return handle_missing_field(field, value)
+    return handle_missing_field(field, value, opts)
   end
 
   return value
@@ -1429,26 +1532,15 @@ end
 -- @param nulls boolean: return nulls as explicit ngx.null values
 -- @return A new table, with the auto fields containing
 -- appropriate updated values.
-function Schema:process_auto_fields(data, context, nulls)
+function Schema:process_auto_fields(data, context, nulls, opts)
   ngx.update_time()
 
   local now_s  = ngx_time()
   local now_ms = ngx_now()
-  local read_before_write = false
-  local cache_key_modified = false
+
   local check_immutable_fields = false
 
   data = tablex.deepcopy(data)
-
-  --[[
-  if context == "select" and self.translations then
-    for _, translation in ipairs(self.translations) do
-      if type(translation.read) == "function" then
-        output = translation.read(output)
-      end
-    end
-  end
-  --]]
 
   if self.shorthands then
     for _, shorthand in ipairs(self.shorthands) do
@@ -1503,13 +1595,7 @@ function Schema:process_auto_fields(data, context, nulls)
       end
     end
 
-    data[key] = adjust_field_for_context(field, data[key], context, nulls)
-
-    if data[key] ~= nil then
-      if self.cache_key_set and self.cache_key_set[key] then
-        cache_key_modified = true
-      end
-    end
+    data[key] = adjust_field_for_context(field, data[key], context, nulls, opts)
 
     if context == "select" and data[key] == null and not nulls then
       data[key] = nil
@@ -1519,50 +1605,35 @@ function Schema:process_auto_fields(data, context, nulls)
       data[key] = floor(data[key])
     end
 
-    -- Set read_before_write to true,
-    -- to handle deep merge of record object on update.
-    if context == "update" and field.type == "record"
-       and data[key] ~= nil and data[key] ~= null then
-      read_before_write = true
-    end
-
     if context == 'update' and field.immutable then
-      -- if entity schema contains immutable fields,
-      -- we need to preform a read-before-write and
-      -- check the existing record to insure update
-      -- is valid.
-      read_before_write = true
       check_immutable_fields = true
     end
   end
 
-  --[[
-  if context ~= "select" and self.translations then
-    for _, translation in ipairs(self.translations) do
-      if type(translation.write) == "function" then
-        data = translation.write(data)
+  if context == "select" then
+    if self.ttl and data.ttl == null and not nulls then
+      data.ttl = nil
+    end
+
+    for key in pairs(data) do
+      local field = self.fields[key]
+      if field then
+        if not field.legacy
+           and field.type == "string"
+           and (field.len_min or 1) > 0
+           and data[key] == ""
+        then
+          data[key] = nulls and null or nil
+        end
+
+      elseif not ((key == "ttl" and self.ttl) or
+                  (key == "ws_id" and opts and opts.show_ws_id)) then
+        data[key] = nil
       end
     end
   end
-  --]]
 
-  if context == "update" and (
-    -- If a partial update does not provide the subschema key,
-    -- we need to do a read-before-write to get it and be
-    -- able to properly validate the entity.
-    (self.subschema_key and data[self.subschema_key] == nil)
-    -- If we're resetting the value of a composite cache key,
-    -- we to do a read-before-write to get the rest of the cache key
-    -- and be able to properly update it.
-    or cache_key_modified
-    -- Entity checks validate across fields, and the field
-    -- that is necessary for validating may not be present.
-    or self.entity_checks)
-  then
-    read_before_write = true
-  end
-
-  return data, nil, read_before_write, check_immutable_fields
+  return data, nil, check_immutable_fields
 end
 
 
@@ -1623,6 +1694,8 @@ end
 -- @param full_check If true, demands entity table to be complete.
 -- If false, accepts missing `required` fields when those are not
 -- needed for global checks.
+-- @param original_input The original input for transformation validations.
+-- @param rbw_entity The read-before-write entity, if any.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed by field name for field errors, plus an "@entity" key
@@ -1641,7 +1714,7 @@ end
 --     }
 --  }
 -- In all cases, the input table is untouched.
-function Schema:validate(input, full_check)
+function Schema:validate(input, full_check, original_input, rbw_entity)
   if full_check == nil then
     full_check = true
   end
@@ -1654,10 +1727,11 @@ function Schema:validate(input, full_check)
         [self.subschema_key] = validation_errors.REQUIRED
       }
     end
-    if not (self.subschemas and self.subschemas[key]) then
+
+    if not get_subschema(self, input) then
       local errmsg = self.subschema_error or validation_errors.SUBSCHEMA_UNKNOWN
       return nil, {
-        [self.subschema_key] = errmsg:format(key)
+        [self.subschema_key] = errmsg:format(type(key) == "string" and key or key[1])
       }
     end
   end
@@ -1673,6 +1747,7 @@ function Schema:validate(input, full_check)
   end
 
   run_entity_checks(self, input, full_check, errors)
+  run_transformation_checks(self, input, original_input, rbw_entity, errors)
 
   if next(errors) then
     return nil, errors
@@ -1712,12 +1787,13 @@ end
 -- It validates fields for their attributes,
 -- and runs the global entity checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_insert(input)
-  return self:validate(input, true)
+function Schema:validate_insert(input, original_input)
+  return self:validate(input, true, original_input)
 end
 
 
@@ -1726,11 +1802,13 @@ end
 -- fields when those are not needed for global checks,
 -- and runs the global checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
+-- @param rbw_entity The read-before-write entity, if any.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_update(input)
+function Schema:validate_update(input, original_input, rbw_entity)
 
   -- Monkey-patch some error messages to make it clearer why they
   -- apply during an update. This avoids propagating update-awareness
@@ -1743,7 +1821,7 @@ function Schema:validate_update(input)
   validation_errors.AT_LEAST_ONE_OF = "when updating, " .. aloo
   validation_errors.CONDITIONAL_AT_LEAST_ONE_OF = "when updating, " .. caloo
 
-  local ok, errors = self:validate(input, false)
+  local ok, errors = self:validate(input, false, original_input, rbw_entity)
 
   -- Restore the original error messages
   validation_errors.REQUIRED_FOR_ENTITY_CHECK = rfec
@@ -1758,12 +1836,13 @@ end
 -- It validates fields for their attributes,
 -- and runs the global entity checks against the entire table.
 -- @param input The input table.
+-- @param original_input The original input for transformation validations.
 -- @return True on success.
 -- On failure, it returns nil and a table containing all errors,
 -- indexed numerically for general errors, and by field name for field errors.
 -- In all cases, the input table is untouched.
-function Schema:validate_upsert(input)
-  return self:validate(input, true)
+function Schema:validate_upsert(input, original_input)
+  return self:validate(input, true, original_input)
 end
 
 
@@ -1889,6 +1968,23 @@ end
 
 
 function Schema:get_constraints()
+  if self.name == "workspaces" then
+    -- merge explicit and implicit constraints for workspaces
+    for _, e in ipairs(_cache["workspaces"].constraints) do
+      local found = false
+      for _, w in ipairs(_workspaceable) do
+        if w == e then
+          found = true
+          break
+        end
+      end
+      if not found then
+        table.insert(_workspaceable, e)
+      end
+    end
+    return _workspaceable
+  end
+
   return _cache[self.name].constraints
 end
 
@@ -1905,6 +2001,75 @@ local function allow_record_fields_by_name(record, loop)
       allow_record_fields_by_name(f, loop)
     end
   end
+end
+
+
+--- Run transformations on fields.
+-- @param input The input table.
+-- @param original_input The original input for transformation detection.
+-- @param context a string describing the CRUD context:
+-- valid values are: "insert", "update", "upsert", "select"
+-- @return the transformed entity
+function Schema:transform(input, original_input, context)
+  if not self.transformations then
+    return input
+  end
+
+  local output = nil
+  for _, transformation in ipairs(self.transformations) do
+    local transform
+    if context == "select" then
+      transform = transformation.on_read
+
+    else
+      transform = transformation.on_write
+    end
+
+    if not transform then
+      goto next
+    end
+
+    local args = {}
+    local argc = 0
+    for _, input_field_name in ipairs(transformation.input) do
+      local value = get_field(output or original_input or input, input_field_name)
+      if is_nonempty(value) then
+        argc = argc + 1
+        if original_input then
+          args[argc] = get_field(output or input, input_field_name)
+        else
+          args[argc] = value
+        end
+
+      else
+        goto next
+      end
+    end
+
+    if transformation.needs then
+      for _, need in ipairs(transformation.needs) do
+        local value = get_field(output or input, need)
+        if is_nonempty(value) then
+          argc = argc + 1
+          args[argc] = get_field(output or input, need)
+
+        else
+          goto next
+        end
+      end
+    end
+
+    local data, err = transform(unpack(args))
+    if err then
+      return nil, validation_errors.TRANSFORMATION_ERROR:format(err)
+    end
+
+    output = self:merge_values(data, output or input)
+
+    ::next::
+  end
+
+  return output or input
 end
 
 
@@ -1960,11 +2125,22 @@ function Schema.new(definition, is_subschema)
     end
   end
 
+  if self.workspaceable and self.name then
+    if not _workspaceable[self.name] then
+      _workspaceable[self.name] = true
+      table.insert(_workspaceable, { schema = self })
+    end
+  end
+
   if self.name then
-    _cache[self.name] = {
-      schema = self,
-      constraints = {},
-    }
+    -- do not reset the constraints list if a schema in reloaded
+    if not _cache[self.name] then
+      _cache[self.name] = {
+        constraints = {},
+      }
+    end
+    -- but always update the schema object in cache
+    _cache[self.name].schema = self
   end
 
   return self
@@ -2020,7 +2196,7 @@ function Schema.define(tbl)
     __call = function(t, arg)
       arg = arg or {}
       for k,v in pairs(t) do
-        if not arg[k] then
+        if arg[k] == nil then
           arg[k] = v
         end
       end

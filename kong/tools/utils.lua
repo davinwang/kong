@@ -4,33 +4,38 @@
 -- NOTE: Before implementing a function here, consider if it will be used in many places
 -- across Kong. If not, a local function in the appropriate module is preferred.
 --
--- @copyright Copyright 2016-2019 Kong Inc. All rights reserved.
+-- @copyright Copyright 2016-2020 Kong Inc. All rights reserved.
 -- @license [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
 -- @module kong.tools.utils
 
 local ffi = require "ffi"
 local uuid = require "resty.jit-uuid"
 local pl_stringx = require "pl.stringx"
+local pl_stringio = require "pl.stringio"
+local zlib = require "ffi-zlib"
 
-local C          = ffi.C
-local ffi_fill   = ffi.fill
-local ffi_new    = ffi.new
-local ffi_str    = ffi.string
-local type       = type
-local pairs      = pairs
-local ipairs     = ipairs
-local select     = select
-local tostring   = tostring
-local sort       = table.sort
-local concat     = table.concat
-local insert     = table.insert
-local lower      = string.lower
-local fmt        = string.format
-local find       = string.find
-local gsub       = string.gsub
-local split      = pl_stringx.split
-local re_find    = ngx.re.find
-local re_match   = ngx.re.match
+local C             = ffi.C
+local ffi_fill      = ffi.fill
+local ffi_new       = ffi.new
+local ffi_str       = ffi.string
+local type          = type
+local pairs         = pairs
+local ipairs        = ipairs
+local select        = select
+local tostring      = tostring
+local sort          = table.sort
+local concat        = table.concat
+local insert        = table.insert
+local lower         = string.lower
+local fmt           = string.format
+local find          = string.find
+local gsub          = string.gsub
+local split         = pl_stringx.split
+local re_find       = ngx.re.find
+local re_match      = ngx.re.match
+local inflate_gzip  = zlib.inflateGzip
+local deflate_gzip  = zlib.deflateGzip
+local stringio_open = pl_stringio.open
 
 ffi.cdef[[
 typedef unsigned char u_char;
@@ -270,6 +275,47 @@ do
     end
   end
 
+  local function compare_keys(a, b)
+    local ta = type(a)
+    if ta == type(b) then
+      return a < b
+    end
+    return ta == "number" -- numbers go first, then the rest of keys (usually strings)
+  end
+
+
+  -- Recursively URL escape and format key and value
+  -- Handles nested arrays and tables
+  local function recursive_encode_args(parent_key, value, raw, no_array_indexes, query)
+    local sub_keys = {}
+    for sk in pairs(value) do
+      sub_keys[#sub_keys + 1] = sk
+    end
+    sort(sub_keys, compare_keys)
+
+    local sub_value, next_sub_key
+    for _, sub_key in ipairs(sub_keys) do
+      sub_value = value[sub_key]
+
+      if type(sub_key) == "number" then
+        if no_array_indexes then
+          next_sub_key = parent_key .. "[]"
+        else
+          next_sub_key = ("%s[%s]"):format(parent_key, tostring(sub_key))
+        end
+      else
+        next_sub_key = ("%s.%s"):format(parent_key, tostring(sub_key))
+      end
+
+      if type(sub_value) == "table" then
+        recursive_encode_args(next_sub_key, sub_value, raw, no_array_indexes, query)
+      else
+        query[#query+1] = encode_args_value(next_sub_key, sub_value, raw)
+      end
+    end
+  end
+
+
   --- Encode a Lua table to a querystring
   -- Tries to mimic ngx_lua's `ngx.encode_args`, but has differences:
   -- * It percent-encodes querystring values.
@@ -277,6 +323,10 @@ do
   -- * It encodes arrays like Lapis instead of like ngx.encode_args to allow interacting with Lapis
   -- * It encodes ngx.null as empty strings
   -- * It encodes true and false as "true" and "false"
+  -- * It is capable of encoding nested data structures:
+  --   * An array access is encoded as `arr[1]`
+  --   * A struct access is encoded as `struct.field`
+  --   * Nested structures can use both: `arr[1].field[3]`
   -- @see https://github.com/Mashape/kong/issues/749
   -- @param[type=table] args A key/value table containing the query args to encode.
   -- @param[type=boolean] raw If true, will not percent-encode any key/value and will ignore special boolean rules.
@@ -292,29 +342,12 @@ do
       keys[#keys+1] = k
     end
 
-    sort(keys)
+    sort(keys, compare_keys)
 
     for _, key in ipairs(keys) do
       local value = args[key]
       if type(value) == "table" then
-        for sub_key, sub_value in pairs(value) do
-          if no_array_indexes then
-            query[#query+1] = encode_args_value(key, sub_value, raw)
-
-          else
-            if type(sub_key) == "number" then
-              query[#query+1] = encode_args_value(("%s[%s]")
-                                  :format(key, tostring(sub_key)), sub_value,
-                                          raw)
-
-            else
-              query[#query+1] = encode_args_value(("%s.%s")
-                                  :format(key, tostring(sub_key)), sub_value,
-                                          raw)
-
-            end
-          end
-        end
+        recursive_encode_args(key, value, raw, no_array_indexes, query)
       elseif value == ngx.null then
         query[#query+1] = encode_args_value(key, "")
       elseif  value ~= nil or raw then
@@ -580,14 +613,16 @@ end
 -- @return success A boolean indicating wether the module was found.
 -- @return module The retrieved module, or the error in case of a failure
 function _M.load_module_if_exists(module_name)
-  local status, res = pcall(require, module_name)
+  local status, res = xpcall(require, function(err)
+                                        return debug.traceback(err)
+                                      end, module_name)
   if status then
     return true, res
   -- Here we match any character because if a module has a dash '-' in its name, we would need to escape it.
   elseif type(res) == "string" and find(res, "module '" .. module_name .. "' not found", nil, true) then
     return false, res
   else
-    error(res)
+    error("error loading module '" .. module_name .. "':\n" .. res)
   end
 end
 
@@ -966,5 +1001,185 @@ function _M.bytes_to_str(bytes, unit, scale)
   error("invalid unit '" .. unit .. "' (expected 'k/K', 'm/M', or 'g/G')", 2)
 end
 
+
+do
+  local NGX_ERROR = ngx.ERROR
+
+  if not pcall(ffi.typeof, "ngx_uint_t") then
+    ffi.cdef [[
+      typedef uintptr_t ngx_uint_t;
+    ]]
+  end
+
+  -- ngx_str_t defined by lua-resty-core
+  local s = ffi.new("ngx_str_t[1]")
+  s[0].data = "10"
+  s[0].len = 2
+
+  if not pcall(function() C.ngx_parse_time(s, 0) end) then
+    ffi.cdef [[
+      ngx_int_t ngx_parse_time(ngx_str_t *line, ngx_uint_t is_sec);
+    ]]
+  end
+
+  function _M.nginx_conf_time_to_seconds(str)
+    s[0].data = str
+    s[0].len = #str
+
+    local ret = C.ngx_parse_time(s, 1)
+    if ret == NGX_ERROR then
+      error("bad argument #1 'str'", 2)
+    end
+
+    return tonumber(ret, 10)
+  end
+end
+
+
+do
+  -- lua-ffi-zlib allocated buffer of length +1,
+  -- so use 64KB - 1 instead
+  local GZIP_CHUNK_SIZE = 65535
+
+  local function gzip_helper(op, input)
+    local f = stringio_open(input)
+    local output_table = {}
+    local output_table_n = 0
+
+    local res, err = op(function(size)
+      return f:read(size)
+    end,
+    function(res)
+      output_table_n = output_table_n + 1
+      output_table[output_table_n] = res
+    end, GZIP_CHUNK_SIZE)
+
+    if not res then
+      return nil, err
+    end
+
+    return concat(output_table)
+  end
+
+  --- Gzip compress the content of a string
+  -- @tparam string str the uncompressed string
+  -- @return gz (string) of the compressed content, or nil, err to if an error occurs
+  function _M.deflate_gzip(str)
+    return gzip_helper(deflate_gzip, str)
+  end
+
+
+  --- Gzip decompress the content of a string
+  -- @tparam string gz the Gzip compressed string
+  -- @return str (string) of the decompressed content, or nil, err to if an error occurs
+  function _M.inflate_gzip(gz)
+    return gzip_helper(inflate_gzip, gz)
+  end
+end
+
+
+local get_mime_type
+local get_error_template
+do
+  local CONTENT_TYPE_JSON    = "application/json"
+  local CONTENT_TYPE_GRPC    = "application/grpc"
+  local CONTENT_TYPE_HTML    = "text/html"
+  local CONTENT_TYPE_XML     = "application/xml"
+  local CONTENT_TYPE_PLAIN   = "text/plain"
+  local CONTENT_TYPE_APP     = "application"
+  local CONTENT_TYPE_TEXT    = "text"
+  local CONTENT_TYPE_DEFAULT = "default"
+  local CONTENT_TYPE_ANY     = "*"
+
+  local MIME_TYPES = {
+    [CONTENT_TYPE_GRPC]     = "",
+    [CONTENT_TYPE_HTML]     = "text/html; charset=utf-8",
+    [CONTENT_TYPE_JSON]     = "application/json; charset=utf-8",
+    [CONTENT_TYPE_PLAIN]    = "text/plain; charset=utf-8",
+    [CONTENT_TYPE_XML]      = "application/xml; charset=utf-8",
+    [CONTENT_TYPE_APP]      = "application/json; charset=utf-8",
+    [CONTENT_TYPE_TEXT]     = "text/plain; charset=utf-8",
+    [CONTENT_TYPE_DEFAULT]  = "application/json; charset=utf-8",
+  }
+
+  local ERROR_TEMPLATES = {
+    [CONTENT_TYPE_GRPC]   = "",
+    [CONTENT_TYPE_HTML]   = [[
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Kong Error</title>
+  </head>
+  <body>
+    <h1>Kong Error</h1>
+    <p>%s.</p>
+  </body>
+</html>
+]],
+    [CONTENT_TYPE_JSON]   = [[
+{
+  "message":"%s"
+}]],
+    [CONTENT_TYPE_PLAIN]  = "%s\n",
+    [CONTENT_TYPE_XML]    = [[
+<?xml version="1.0" encoding="UTF-8"?>
+<error>
+  <message>%s</message>
+</error>
+]],
+  }
+
+  get_mime_type = function(content_header, use_default)
+    use_default = use_default == nil or use_default
+    content_header = _M.strip(content_header)
+    content_header = _M.split(content_header, ";")[1]
+    local mime_type
+
+    local entries = split(content_header, "/")
+    if #entries > 1 then
+      if entries[2] == CONTENT_TYPE_ANY then
+        if entries[1] == CONTENT_TYPE_ANY then
+          mime_type = MIME_TYPES["default"]
+        else
+          mime_type = MIME_TYPES[entries[1]]
+        end
+      else
+        mime_type = MIME_TYPES[content_header]
+      end
+    end
+
+    if mime_type or use_default then
+      return mime_type or MIME_TYPES["default"]
+    end
+
+    return nil, "could not find MIME type"
+  end
+
+
+  get_error_template = function(mime_type)
+    if mime_type == CONTENT_TYPE_JSON or mime_type == MIME_TYPES[CONTENT_TYPE_JSON] then
+      return ERROR_TEMPLATES[CONTENT_TYPE_JSON]
+
+    elseif mime_type == CONTENT_TYPE_HTML or mime_type == MIME_TYPES[CONTENT_TYPE_HTML] then
+      return ERROR_TEMPLATES[CONTENT_TYPE_HTML]
+
+    elseif mime_type == CONTENT_TYPE_XML or mime_type == MIME_TYPES[CONTENT_TYPE_XML] then
+      return ERROR_TEMPLATES[CONTENT_TYPE_XML]
+
+    elseif mime_type == CONTENT_TYPE_PLAIN or mime_type == MIME_TYPES[CONTENT_TYPE_PLAIN] then
+      return ERROR_TEMPLATES[CONTENT_TYPE_PLAIN]
+
+    elseif mime_type == CONTENT_TYPE_GRPC or mime_type == MIME_TYPES[CONTENT_TYPE_GRPC] then
+      return ERROR_TEMPLATES[CONTENT_TYPE_GRPC]
+
+    end
+
+    return nil, "no template found for MIME type " .. (mime_type or "empty")
+  end
+
+end
+_M.get_mime_type = get_mime_type
+_M.get_error_template = get_error_template
 
 return _M

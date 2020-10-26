@@ -45,21 +45,52 @@ for _, strategy in helpers.each_strategy() do
     end)
 
     describe("http_client", function()
-      it("encodes arrays in a way Lapis-compatible way when using form-urlencoded content-type", function()
-        local r = proxy_client:get("/", {
-          headers = {
-            ["Content-type"] = "application/x-www-form-urlencoded",
-            host             = "mock_upstream",
-          },
-          body    = {
-            names = { "alice", "bob", "casius" },
-          },
-        })
-        local json = assert.response(r).has.jsonbody()
-        local params = json.post_data.params
-        assert.equals("alice",  params["names[1]"])
-        assert.equals("bob",    params["names[2]"])
-        assert.equals("casius", params["names[3]"])
+      it("encodes nested tables and arrays in Kong-compatible way when using form-urlencoded content-type", function()
+        local tests = {
+          { input = { names = { "alice", "bob", "casius" } },
+            expected = { ["names[1]"] = "alice",
+                         ["names[2]"] = "bob",
+                         ["names[3]"] = "casius" } },
+
+          { input = { headers = { location = { "here", "there", "everywhere" } } },
+            expected = { ["headers.location[1]"] = "here",
+                         ["headers.location[2]"] = "there",
+                         ["headers.location[3]"] = "everywhere" } },
+
+          { input = { ["hello world"] = "foo, bar" } ,
+            expected = { ["hello world"] = "foo, bar" } },
+
+          { input = { hash = { answer = 42 } },
+            expected = { ["hash.answer"] = "42" } },
+
+          { input = { hash_array = { arr = { "one", "two" } } },
+            expected = { ["hash_array.arr[1]"] = "one",
+                         ["hash_array.arr[2]"] = "two" } },
+
+          { input = { array_hash = { { name = "peter" } } },
+            expected = { ["array_hash[1].name"] = "peter" } },
+
+          { input = { array_array = { { "x", "y" } } },
+            expected = { ["array_array[1][1]"] = "x",
+                         ["array_array[1][2]"] = "y" } },
+
+          { input = { hybrid = { 1, 2, n = 3 } },
+            expected = { ["hybrid[1]"] = "1",
+                         ["hybrid[2]"] = "2",
+                         ["hybrid.n"] = "3" } },
+        }
+
+        for i = 1, #tests do
+          local r = proxy_client:get("/", {
+            headers = {
+              ["Content-type"] = "application/x-www-form-urlencoded",
+              host             = "mock_upstream",
+            },
+            body = tests[i].input
+          })
+          local json = assert.response(r).has.jsonbody()
+          assert.same(tests[i].expected, json.post_data.params)
+        end
       end)
     end)
 
@@ -414,5 +445,56 @@ for _, strategy in helpers.each_strategy() do
         assert.error(function() assert.request(r).has.formparam("hello") end)
       end)
     end)
+
+
+    describe("certificates,", function()
+
+      local function get_cert(server_name)
+        local _, _, stdout = assert(helpers.execute(
+          string.format("echo 'GET /' | openssl s_client -connect 0.0.0.0:%d -servername %s",
+                        helpers.get_proxy_port(true), server_name)
+        ))
+        return stdout
+      end
+
+
+      it("cn assertion with 2 parameters, positive success", function()
+        local cert = get_cert("ssl1.com")
+        assert.has.cn("localhost", cert)
+      end)
+
+      it("cn assertion with 2 parameters, positive failure", function()
+        local cert = get_cert("ssl1.com")
+        assert.has.error(function()
+          assert.has.cn("some.other.host.org", cert)
+        end)
+      end)
+
+      it("cn assertion with 2 parameters, negative success", function()
+        local cert = get_cert("ssl1.com")
+        assert.Not.cn("some.other.host.org", cert)
+      end)
+
+      it("cn assertion with 2 parameters, negative failure", function()
+        local cert = get_cert("ssl1.com")
+        assert.has.error(function()
+          assert.Not.cn("localhost", cert)
+        end)
+      end)
+
+      it("cn assertion with modifier and 1 parameter", function()
+        local cert = get_cert("ssl1.com")
+        assert.certificate(cert).has.cn("localhost")
+      end)
+
+      it("cn assertion with modifier and 2 parameters fails", function()
+        local cert = get_cert("ssl1.com")
+        assert.has.error(function()
+          assert.certificate(cert).has.cn("localhost", cert)
+        end)
+      end)
+
+    end)
+
   end)
 end

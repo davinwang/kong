@@ -5,7 +5,7 @@
 -- @module kong.request
 
 
-local cjson = require "cjson.safe"
+local cjson = require "cjson.safe".new()
 local multipart = require "multipart"
 local phase_checker = require "kong.pdk.private.phases"
 
@@ -24,9 +24,13 @@ local check_not_phase = phase_checker.check_not
 local PHASES = phase_checker.phases
 
 
+cjson.decode_array_with_array_mt(true)
+
+
 local function new(self)
   local _REQUEST = {}
 
+  local HOST_PORTS             = self.configuration.host_ports or {}
 
   local MIN_HEADERS            = 1
   local MAX_HEADERS_DEFAULT    = 100
@@ -50,6 +54,7 @@ local function new(self)
   local X_FORWARDED_PROTO      = "X-Forwarded-Proto"
   local X_FORWARDED_HOST       = "X-Forwarded-Host"
   local X_FORWARDED_PORT       = "X-Forwarded-Port"
+  local X_FORWARDED_PREFIX     = "X-Forwarded-Prefix"
 
 
   ---
@@ -146,7 +151,7 @@ local function new(self)
   -- `X-Forwarded-Host` if it comes from a trusted source. The returned value
   -- is normalized to lower-case.
   --
-  -- Whether this function considers `X-Forwarded-Proto` or not depends on
+  -- Whether this function considers `X-Forwarded-Host` or not depends on
   -- several Kong configuration parameters:
   --
   -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
@@ -196,9 +201,16 @@ local function new(self)
   -- **Note**: we do not currently offer support for Forwarded HTTP Extension
   -- (RFC 7239) since it is not supported by ngx_http_realip_module.
   --
-  -- @function kong.request.get_forwareded_port
+  -- When running Kong behind the L4 port mapping (or forwarding) you can also
+  -- configure:
+  -- * [port\_maps](https://getkong.org/docs/latest/configuration/#port_maps)
+  --
+  -- `port_maps` configuration parameter enables this function to return the
+  -- port to which the port Kong is listening to is mapped to (in case they differ).
+  --
+  -- @function kong.request.get_forwarded_port
   -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn number the forwared port
+  -- @treturn number the forwarded port
   -- @usage
   -- kong.request.get_forwarded_port() -- 1234
   function _REQUEST.get_forwarded_port()
@@ -228,20 +240,61 @@ local function new(self)
       end
     end
 
-    return _REQUEST.get_port()
+    local host_port = ngx.ctx.host_port
+    if host_port then
+      return host_port
+    end
+
+    local port = _REQUEST.get_port()
+    return HOST_PORTS[port] or port
+  end
+
+
+  ---
+  -- Returns the path component of the request's URL, but also considers
+  -- `X-Forwarded-Prefix` if it comes from a trusted source. The value
+  -- is returned as a Lua string.
+  --
+  -- Whether this function considers `X-Forwarded-Prefix` or not depends on
+  -- several Kong configuration parameters:
+  --
+  -- * [trusted\_ips](https://getkong.org/docs/latest/configuration/#trusted_ips)
+  -- * [real\_ip\_header](https://getkong.org/docs/latest/configuration/#real_ip_header)
+  -- * [real\_ip\_recursive](https://getkong.org/docs/latest/configuration/#real_ip_recursive)
+  --
+  -- **Note**: we do not currently do any normalization on the request
+  --           path except return `"/"` on empty path.
+  --
+  -- @function kong.request.get_forwarded_path
+  -- @phases rewrite, access, header_filter, body_filter, log, admin_api
+  -- @treturn string the forwarded path
+  -- @usage
+  -- kong.request.get_forwarded_path() -- /path
+  function _REQUEST.get_forwarded_path()
+    check_phase(PHASES.request)
+
+    if self.ip.is_trusted(self.client.get_ip()) then
+      local prefix = _REQUEST.get_header(X_FORWARDED_PREFIX)
+      if prefix then
+        return prefix
+      end
+    end
+
+    local path = _REQUEST.get_path()
+    return path == "" and "/" or path
   end
 
 
   ---
   -- Returns the HTTP version used by the client in the request as a Lua
-  -- number, returning values such as `"1.1"` and `"2.0."`, or `nil` for
+  -- number, returning values such as `1`, `1.1`, `2.0`, or `nil` for
   -- unrecognized values.
   --
   -- @function kong.request.get_http_version
   -- @phases rewrite, access, header_filter, body_filter, log, admin_api
-  -- @treturn string|nil the http version
+  -- @treturn number|nil the HTTP version as a Lua number
   -- @usage
-  -- kong.request.get_http_version() -- "1.1"
+  -- kong.request.get_http_version() -- 1.1
   function _REQUEST.get_http_version()
     check_phase(PHASES.request)
 
@@ -260,6 +313,14 @@ local function new(self)
   -- kong.request.get_method() -- "GET"
   function _REQUEST.get_method()
     check_phase(PHASES.request)
+
+    if ngx.ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
+      local req_line = ngx.var.request
+      local idx = find(req_line, " ", 1, true)
+      if idx then
+        return sub(req_line, 1, idx - 1)
+      end
+    end
 
     return ngx.req.get_method()
   end
@@ -394,19 +455,36 @@ local function new(self)
     check_phase(PHASES.request)
 
     if max_args == nil then
-      return ngx.req.get_uri_args(MAX_QUERY_ARGS_DEFAULT)
+      max_args = MAX_QUERY_ARGS_DEFAULT
+
+    else
+      if type(max_args) ~= "number" then
+        error("max_args must be a number", 2)
+      end
+
+      if max_args < MIN_QUERY_ARGS then
+        error("max_args must be >= " .. MIN_QUERY_ARGS, 2)
+      end
+
+      if max_args > MAX_QUERY_ARGS then
+        error("max_args must be <= " .. MAX_QUERY_ARGS, 2)
+      end
     end
 
-    if type(max_args) ~= "number" then
-      error("max_args must be a number", 2)
-    end
+    if ngx.ctx.KONG_UNEXPECTED and _REQUEST.get_http_version() < 2 then
+      local req_line = ngx.var.request
+      local qidx = find(req_line, "?", 1, true)
+      if not qidx then
+        return {}
+      end
 
-    if max_args < MIN_QUERY_ARGS then
-      error("max_args must be >= " .. MIN_QUERY_ARGS, 2)
-    end
+      local eidx = find(req_line, " ", qidx + 1, true)
+      if not eidx then
+        -- HTTP 414, req_line is too long
+        return {}
+      end
 
-    if max_args > MAX_QUERY_ARGS then
-      error("max_args must be <= " .. MAX_QUERY_ARGS, 2)
+      return ngx.decode_args(sub(req_line, qidx + 1, eidx - 1), max_args)
     end
 
     return ngx.req.get_uri_args(max_args)
@@ -507,7 +585,10 @@ local function new(self)
   end
 
 
-  local before_content = phase_checker.new(PHASES.rewrite, PHASES.access, PHASES.admin_api)
+  local before_content = phase_checker.new(PHASES.rewrite,
+                                           PHASES.access,
+                                           PHASES.error,
+                                           PHASES.admin_api)
 
 
   ---
@@ -635,9 +716,7 @@ local function new(self)
         return nil, err, CONTENT_TYPE_JSON
       end
 
-      cjson.decode_array_with_array_mt(true)
       local json = cjson.decode(body)
-      cjson.decode_array_with_array_mt(false)
       if type(json) ~= "table" then
         return nil, "invalid json body", CONTENT_TYPE_JSON
       end

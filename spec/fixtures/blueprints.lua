@@ -1,4 +1,3 @@
-local cluster_ca_tools = require "kong.tools.cluster_ca"
 local ssl_fixtures = require "spec.fixtures.ssl"
 local utils = require "kong.tools.utils"
 
@@ -21,6 +20,18 @@ function Blueprint:insert(overrides, options)
   if err then
     error(err, 2)
   end
+  return entity
+end
+
+
+-- insert blueprint in workspace specified by `ws`
+function Blueprint:insert_ws(overrides, workspace)
+  local old_workspace = ngx.ctx.workspace
+
+  ngx.ctx.workspace = workspace.id
+  local entity = self:insert(overrides)
+  ngx.ctx.workspace = old_workspace
+
   return entity
 end
 
@@ -99,13 +110,22 @@ function _M.new(db)
     }
   end)
 
+  res.ca_certificates = new_blueprint(db.ca_certificates, function()
+    return {
+      cert = ssl_fixtures.cert_ca,
+    }
+  end)
+
   local upstream_name_seq = new_sequence("upstream-%d")
   res.upstreams = new_blueprint(db.upstreams, function(overrides)
     local slots = overrides.slots or 100
+    local name = overrides.name or upstream_name_seq:next()
+    local host_header = overrides.host_header or nil
 
     return {
-      name      = upstream_name_seq:next(),
+      name      = name,
       slots     = slots,
+      host_header = host_header,
     }
   end)
 
@@ -332,19 +352,17 @@ function _M.new(db)
     }
   end)
 
+  local workspace_name_seq = new_sequence("workspace-name-%d")
+  res.workspaces = new_blueprint(db.workspaces, function()
+    return {
+      name = workspace_name_seq:next(),
+    }
+  end)
+
   res.rewriter_plugins = new_blueprint(db.plugins, function()
     return {
       name   = "rewriter",
       config = {},
-    }
-  end)
-
-  res.cluster_ca = new_blueprint(db.cluster_ca, function()
-    local ca_key = cluster_ca_tools.new_key()
-    local ca_cert = cluster_ca_tools.new_ca(ca_key)
-    return {
-      key = ca_key:toPEM("private"),
-      cert = ca_cert:toPEM(),
     }
   end)
 

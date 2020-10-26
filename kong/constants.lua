@@ -27,12 +27,15 @@ local plugins = {
   "request-termination",
   -- external plugins
   "azure-functions",
-  "kubernetes-sidecar-injector",
   "zipkin",
   "pre-function",
   "post-function",
   "prometheus",
   "proxy-cache",
+  "session",
+  "acme",
+  "grpc-web",
+  "grpc-gateway",
 }
 
 local plugin_map = {}
@@ -51,7 +54,9 @@ local protocols_with_subsystem = {
   http = "http",
   https = "http",
   tcp = "stream",
-  tls = "stream"
+  tls = "stream",
+  grpc = "http",
+  grpcs = "http",
 }
 local protocols = {}
 for p,_ in pairs(protocols_with_subsystem) do
@@ -59,19 +64,22 @@ for p,_ in pairs(protocols_with_subsystem) do
 end
 table.sort(protocols)
 
-return {
+local constants = {
   BUNDLED_PLUGINS = plugin_map,
   DEPRECATED_PLUGINS = deprecated_plugin_map,
   -- non-standard headers, specific to Kong
   HEADERS = {
     HOST_OVERRIDE = "X-Host-Override",
     PROXY_LATENCY = "X-Kong-Proxy-Latency",
+    RESPONSE_LATENCY = "X-Kong-Response-Latency",
+    ADMIN_LATENCY = "X-Kong-Admin-Latency",
     UPSTREAM_LATENCY = "X-Kong-Upstream-Latency",
     UPSTREAM_STATUS = "X-Kong-Upstream-Status",
     CONSUMER_ID = "X-Consumer-ID",
     CONSUMER_CUSTOM_ID = "X-Consumer-Custom-ID",
     CONSUMER_USERNAME = "X-Consumer-Username",
-    CREDENTIAL_USERNAME = "X-Credential-Username",
+    CREDENTIAL_USERNAME = "X-Credential-Username", -- TODO: deprecated, use CREDENTIAL_IDENTIFIER instead
+    CREDENTIAL_IDENTIFIER = "X-Credential-Identifier",
     RATELIMIT_LIMIT = "X-RateLimit-Limit",
     RATELIMIT_REMAINING = "X-RateLimit-Remaining",
     CONSUMER_GROUPS = "X-Consumer-Groups",
@@ -84,18 +92,38 @@ return {
   },
   -- Notice that the order in which they are listed is important:
   -- schemas of dependencies need to be loaded first.
+  --
+  -- This table doubles as a set (e.g. CORE_ENTITIES["routes"] = true)
+  -- (see below where the set entries are populated)
   CORE_ENTITIES = {
+    "workspaces",
     "consumers",
+    "certificates",
     "services",
     "routes",
-    "certificates",
     "snis",
     "upstreams",
     "targets",
     "plugins",
-    "cluster_ca",
     "tags",
+    "ca_certificates",
   },
+  ENTITY_CACHE_STORE = setmetatable({
+    consumers = "cache",
+    certificates = "core_cache",
+    services = "core_cache",
+    routes = "core_cache",
+    snis = "core_cache",
+    upstreams = "core_cache",
+    targets = "core_cache",
+    plugins = "core_cache",
+    tags = "cache",
+    ca_certificates = "core_cache",
+  }, {
+    __index = function()
+      return "cache"
+    end
+  }),
   RATELIMIT = {
     PERIODS = {
       "second",
@@ -108,8 +136,7 @@ return {
   },
   REPORTS = {
     ADDRESS = "kong-hf.konghq.com",
-    SYSLOG_PORT = 61828,
-    STATS_PORT = 61829
+    STATS_PORT = 61830
   },
   DICTS = {
     "kong",
@@ -133,4 +160,18 @@ return {
   },
   PROTOCOLS = protocols,
   PROTOCOLS_WITH_SUBSYSTEM = protocols_with_subsystem,
+
+  DECLARATIVE_FLIPS = {
+    name = "declarative:flips",
+    ttl = 60,
+  }
 }
+
+
+-- Make the CORE_ENTITIES table usable both as an ordered array and as a set
+for _, v in ipairs(constants.CORE_ENTITIES) do
+  constants.CORE_ENTITIES[v] = true
+end
+
+
+return constants
